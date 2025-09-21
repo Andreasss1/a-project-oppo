@@ -1,0 +1,646 @@
+# ==========================================
+# COMPLETE YOLO8 TRAINING PIPELINE
+# Final Integration dengan Semua Optimasi
+# ==========================================
+
+import os
+import sys
+import yaml
+import torch
+import numpy as np
+import cv2
+from pathlib import Path
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+from ultralytics.utils import callbacks
+import wandb
+
+# Import semua custom modules
+# (Pastikan semua code sebelumnya sudah dijalankan)
+
+# ==========================================
+# MAIN TRAINING PIPELINE
+# ==========================================
+
+class AdvancedYOLOTrainer:
+    """Advanced YOLO trainer dengan semua optimasi"""
+    
+    def __init__(self, data_path, config=None):
+        self.data_path = Path(data_path)
+        self.config = config or self.get_default_config()
+        
+        # Initialize components
+        self.setup_logging()
+        self.setup_directories()
+        
+    def get_default_config(self):
+        """Default konfigurasi untuk screen defect detection"""
+        return {
+            'model_size': 'yolov8n.pt',  # n, s, m, l, x
+            'image_size': 640,
+            'batch_size': 16,
+            'epochs': 200,
+            'patience': 20,
+            'workers': 4,
+            
+            # Curriculum Learning
+            'curriculum_learning': True,
+            'initial_size': 320,
+            'final_size': 640,
+            
+            # Class Imbalance
+            'use_focal_loss': True,
+            'focal_alpha': 1.0,
+            'focal_gamma': 2.0,
+            'dynamic_weighting': True,
+            'balanced_sampling': True,
+            
+            # Small Object Optimization
+            'multi_scale_training': True,
+            'mosaic_prob': 1.0,
+            'mixup_prob': 0.15,
+            'copy_paste_prob': 0.3,
+            
+            # Advanced Modules
+            'use_ghost_conv': True,
+            'use_bifpn': True,
+            'use_carafe': True,
+            
+            # Augmentation
+            'smart_augmentation': True,
+            'augmentation_strength': 'adaptive',
+            
+            # Synthetic Data
+            'generate_synthetic': False,
+            'synthetic_ratio': 0.2,
+            
+            # Monitoring
+            'use_wandb': True,
+            'save_period': 10,
+            'val_period': 5,
+        }
+    
+    def setup_logging(self):
+        """Setup logging dan monitoring"""
+        if self.config['use_wandb']:
+            wandb.init(
+                project="screen-defect-detection-advanced",
+                config=self.config,
+                name=f"yolo8_advanced_{self.config['model_size']}"
+            )
+    
+    def setup_directories(self):
+        """Setup working directories"""
+        self.runs_dir = Path('runs/detect/advanced_yolo8')
+        self.runs_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Copy dataset config
+        self.dataset_config = self.data_path / 'dataset.yaml'
+        if not self.dataset_config.exists():
+            self.create_dataset_config()
+    
+    def create_dataset_config(self):
+        """Create dataset configuration"""
+        with open(self.data_path / 'classes.txt', 'r') as f:
+            classes = [line.strip() for line in f.readlines()]
+        
+        config = {
+            'path': str(self.data_path),
+            'train': 'images/train',
+            'val': 'images/val',
+            'test': 'images/test',
+            'nc': len(classes),
+            'names': classes
+        }
+        
+        with open(self.dataset_config, 'w') as f:
+            yaml.dump(config, f)
+    
+    def analyze_dataset_distribution(self):
+        """Analisis distribusi dataset"""
+        print("📊 Analyzing dataset distribution...")
+        
+        # Analyze train set
+        train_labels_path = self.data_path / 'labels' / 'train'
+        class_counts = {}
+        bbox_areas = []
+        
+        for label_file in train_labels_path.glob('*.txt'):
+            with open(label_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        class_id = int(parts[0])
+                        _, _, w, h = map(float, parts[1:5])
+                        
+                        class_counts[class_id] = class_counts.get(class_id, 0) + 1
+                        bbox_areas.append(w * h)
+        
+        # Calculate class weights
+        total_samples = sum(class_counts.values())
+        self.class_weights = {}
+        for class_id, count in class_counts.items():
+            self.class_weights[class_id] = total_samples / (len(class_counts) * count)
+        
+        # Small object analysis
+        small_objects = [area for area in bbox_areas if area < 0.01]
+        small_ratio = len(small_objects) / len(bbox_areas) if bbox_areas else 0
+        
+        print(f"   📈 Total samples: {total_samples}")
+        print(f"   📊 Classes: {len(class_counts)}")
+        print(f"   🔍 Small objects: {len(small_objects)}/{len(bbox_areas)} ({small_ratio:.1%})")
+        print(f"   ⚖️ Class imbalance ratio: {max(class_counts.values())/min(class_counts.values()):.1f}x")
+        
+        return class_counts, self.class_weights, small_ratio
+    
+    def setup_advanced_model(self):
+        """Setup model dengan advanced modules"""
+        print("🔧 Setting up advanced model...")
+        
+        # Load base model
+        self.model = YOLO(self.config['model_size'])
+        
+        # Integrate advanced modules jika diminta
+        if self.config['use_ghost_conv'] or self.config['use_bifpn'] or self.config['use_carafe']:
+            print("   🚀 Integrating advanced modules...")
+            integrate_advanced_modules()
+        
+        # Modify training parameters untuk small objects
+        if hasattr(self.model.model, 'yaml'):
+            # Custom anchors untuk small objects
+            custom_anchors = [
+                [4, 5, 8, 10, 13, 16],      # P3/8
+                [23, 29, 43, 55, 73, 105],  # P4/16  
+                [146, 217, 231, 300, 335, 433]  # P5/32
+            ]
+            self.model.model.yaml['anchors'] = custom_anchors
+        
+        print("   ✅ Advanced model ready!")
+        return self.model
+    
+    def setup_curriculum_learning(self):
+        """Setup curriculum learning"""
+        if self.config['curriculum_learning']:
+            self.curriculum = CurriculumLearningScheduler(
+                initial_size=self.config['initial_size'],
+                final_size=self.config['final_size'], 
+                epochs=self.config['epochs']
+            )
+            print("   📚 Curriculum learning enabled")
+            return self.curriculum
+        return None
+    
+    def setup_imbalanced_training(self):
+        """Setup imbalanced training components"""
+        print("⚖️ Setting up imbalanced training...")
+        
+        components = {}
+        
+        # Dynamic class weighting
+        if self.config['dynamic_weighting']:
+            components['dynamic_weighting'] = DynamicClassWeighting(
+                num_classes=len(self.class_weights),
+                initial_weights=list(self.class_weights.values())
+            )
+        
+        # Focal loss
+        if self.config['use_focal_loss']:
+            components['focal_loss'] = FocalLoss(
+                alpha=self.config['focal_alpha'],
+                gamma=self.config['focal_gamma']
+            )
+        
+        # Smart augmentation
+        if self.config['smart_augmentation']:
+            class_counts = {i: int(1000/w) for i, w in enumerate(self.class_weights.values())}
+            components['smart_aug'] = ImbalanceAwareAugmentation(class_counts)
+        
+        print("   ✅ Imbalanced training components ready!")
+        return components
+    
+    def create_training_config(self, current_epoch=0):
+        """Create training configuration dengan dynamic parameters"""
+        
+        # Base config
+        train_config = {
+            'data': str(self.dataset_config),
+            'epochs': self.config['epochs'],
+            'patience': self.config['patience'],
+            'batch': self.config['batch_size'],
+            'device': 0 if torch.cuda.is_available() else 'cpu',
+            'workers': self.config['workers'],
+            'project': str(self.runs_dir.parent),
+            'name': self.runs_dir.name,
+            'exist_ok': True,
+            'save_period': self.config['save_period'],
+            'val': True,
+            
+            # Optimizer
+            'optimizer': 'AdamW',
+            'lr0': 0.001,
+            'lrf': 0.01,
+            'momentum': 0.9,
+            'weight_decay': 0.0005,
+            'warmup_epochs': 3.0,
+            
+            # Loss weights untuk small objects
+            'box': 7.5,
+            'cls': 0.5,
+            'dfl': 1.5,
+            
+            # Validation
+            'conf': 0.001,  # Low confidence untuk small objects
+            'iou': 0.6,
+            'max_det': 300,
+            'save_json': True,
+            'plots': True,
+            'save_txt': True,
+        }
+        
+        # Curriculum learning image size
+        if hasattr(self, 'curriculum') and self.curriculum:
+            train_config['imgsz'] = self.curriculum.get_image_size(current_epoch)
+            
+            # Dynamic augmentation strength
+            aug_params = self.curriculum.get_augmentation_strength(current_epoch)
+            train_config.update({
+                'degrees': aug_params['rotation_limit'],
+                'hsv_v': aug_params['brightness_limit'],
+                'hsv_s': aug_params['brightness_limit'],
+                'mixup': aug_params['mixup_alpha'],
+            })
+        else:
+            train_config['imgsz'] = self.config['image_size']
+        
+        # Augmentation untuk small objects
+        if self.config['multi_scale_training']:
+            train_config.update({
+                'hsv_h': 0.015,
+                'hsv_s': 0.7,
+                'hsv_v': 0.4,
+                'degrees': 15.0,
+                'translate': 0.1,
+                'scale': 0.15,
+                'shear': 2.0,
+                'perspective': 0.0001,
+                'flipud': 0.2,
+                'fliplr': 0.5,
+                'mosaic': self.config['mosaic_prob'],
+                'mixup': self.config['mixup_prob'],
+                'copy_paste': self.config['copy_paste_prob'],
+            })
+        
+        return train_config
+    
+    def train_model(self):
+        """Main training loop"""
+        print("🚀 Starting advanced training...")
+        
+        # Setup components
+        class_counts, class_weights, small_ratio = self.analyze_dataset_distribution()
+        model = self.setup_advanced_model()
+        curriculum = self.setup_curriculum_learning()
+        imbalance_components = self.setup_imbalanced_training()
+        
+        # Training config
+        train_config = self.create_training_config()
+        
+        print(f"📋 Training Configuration:")
+        print(f"   🎯 Model: {self.config['model_size']}")
+        print(f"   📐 Image size: {train_config['imgsz']}px")
+        print(f"   📦 Batch size: {train_config['batch']}")
+        print(f"   🔄 Epochs: {train_config['epochs']}")
+        print(f"   ⚖️ Class weights: {len(class_weights)} classes")
+        print(f"   🔍 Small objects: {small_ratio:.1%}")
+        
+        # Start training
+        try:
+            results = model.train(**train_config)
+            
+            print("✅ Training completed!")
+            
+            # Post-training evaluation
+            self.evaluate_model(model, small_ratio)
+            
+            return model, results
+            
+        except Exception as e:
+            print(f"❌ Training failed: {e}")
+            return None, None
+        
+        finally:
+            if self.config['use_wandb']:
+                wandb.finish()
+    
+    def evaluate_model(self, model, small_ratio):
+        """Comprehensive model evaluation"""
+        print("🔍 Evaluating model performance...")
+        
+        # Load best model
+        best_model_path = self.runs_dir / 'weights' / 'best.pt'
+        if best_model_path.exists():
+            best_model = YOLO(str(best_model_path))
+            
+            # Test set evaluation
+            test_results = best_model.val(
+                data=str(self.dataset_config),
+                split='test',
+                conf=0.001,
+                iou=0.6,
+                save_json=True,
+                plots=True
+            )
+            
+            # Detailed analysis
+            self.analyze_small_object_performance(best_model)
+            self.create_performance_report(test_results, small_ratio)
+    
+    def analyze_small_object_performance(self, model):
+        """Analisis khusus untuk small object performance"""
+        print("   🔬 Analyzing small object performance...")
+        
+        test_images_path = self.data_path / 'images' / 'test'
+        test_labels_path = self.data_path / 'labels' / 'test'
+        
+        if not test_images_path.exists():
+            print("   ⚠️ No test images found, skipping analysis")
+            return
+        
+        small_object_stats = {
+            'total_small': 0,
+            'detected_small': 0,
+            'false_positives': 0,
+            'avg_confidence': 0,
+            'size_distribution': []
+        }
+        
+        for img_path in list(test_images_path.glob('*.jpg'))[:20]:  # Sample 20 images
+            label_path = test_labels_path / (img_path.stem + '.txt')
+            
+            if not label_path.exists():
+                continue
+            
+            # Ground truth
+            gt_boxes = []
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 5:
+                        _, _, w, h = map(float, parts[1:5])
+                        area = w * h
+                        if area < 0.01:  # Small object
+                            gt_boxes.append((w, h, area))
+                            small_object_stats['total_small'] += 1
+            
+            # Predictions
+            results = model(str(img_path), conf=0.001, verbose=False)
+            
+            if results and len(results) > 0:
+                result = results[0]
+                if result.boxes is not None:
+                    # Analyze predictions
+                    boxes = result.boxes.xyxy.cpu().numpy()
+                    confs = result.boxes.conf.cpu().numpy()
+                    
+                    img = cv2.imread(str(img_path))
+                    h, w = img.shape[:2]
+                    
+                    for box, conf in zip(boxes, confs):
+                        x1, y1, x2, y2 = box
+                        box_w = (x2 - x1) / w
+                        box_h = (y2 - y1) / h
+                        area = box_w * box_h
+                        
+                        if area < 0.01:  # Small prediction
+                            small_object_stats['detected_small'] += 1
+                            small_object_stats['avg_confidence'] += conf
+                            small_object_stats['size_distribution'].append(area)
+        
+        # Calculate metrics
+        if small_object_stats['detected_small'] > 0:
+            small_object_stats['avg_confidence'] /= small_object_stats['detected_small']
+        
+        detection_rate = (small_object_stats['detected_small'] / 
+                         max(1, small_object_stats['total_small']))
+        
+        print(f"   📊 Small Object Performance:")
+        print(f"      🎯 Detection rate: {detection_rate:.1%}")
+        print(f"      🔍 Average confidence: {small_object_stats['avg_confidence']:.3f}")
+        print(f"      📈 Detected: {small_object_stats['detected_small']}/{small_object_stats['total_small']}")
+    
+    def create_performance_report(self, test_results, small_ratio):
+        """Create comprehensive performance report"""
+        print("📈 Creating performance report...")
+        
+        report = {
+            'model_info': {
+                'size': self.config['model_size'],
+                'image_size': self.config['image_size'],
+                'epochs': self.config['epochs'],
+            },
+            'dataset_info': {
+                'classes': len(self.class_weights),
+                'small_object_ratio': small_ratio,
+                'imbalance_ratio': max(self.class_weights.values()) / min(self.class_weights.values())
+            },
+            'performance': {
+                'mAP50': getattr(test_results, 'box.map50', 'N/A'),
+                'mAP50-95': getattr(test_results, 'box.map', 'N/A'),
+                'precision': getattr(test_results, 'box.mp', 'N/A'),
+                'recall': getattr(test_results, 'box.mr', 'N/A'),
+            },
+            'optimizations': {
+                'curriculum_learning': self.config['curriculum_learning'],
+                'focal_loss': self.config['use_focal_loss'],
+                'dynamic_weighting': self.config['dynamic_weighting'],
+                'advanced_modules': any([
+                    self.config['use_ghost_conv'],
+                    self.config['use_bifpn'], 
+                    self.config['use_carafe']
+                ])
+            }
+        }
+        
+        # Save report
+        report_path = self.runs_dir / 'performance_report.json'
+        import json
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2, default=str)
+        
+        print(f"   📄 Report saved: {report_path}")
+        
+        # Print summary
+        print(f"📋 Final Performance Summary:")
+        if hasattr(test_results, 'box'):
+            print(f"   🎯 mAP@0.5: {getattr(test_results.box, 'map50', 0):.3f}")
+            print(f"   🎯 mAP@0.5:0.95: {getattr(test_results.box, 'map', 0):.3f}")
+            print(f"   📊 Precision: {getattr(test_results.box, 'mp', 0):.3f}")
+            print(f"   📊 Recall: {getattr(test_results.box, 'mr', 0):.3f}")
+        
+        return report
+
+# ==========================================
+# UTILITY FUNCTIONS
+# ==========================================
+
+def export_optimized_model(model_path, export_formats=['onnx', 'tflite']):
+    """Export model untuk deployment"""
+    print(f"📦 Exporting model: {model_path}")
+    
+    model = YOLO(model_path)
+    
+    for fmt in export_formats:
+        try:
+            if fmt == 'onnx':
+                model.export(format='onnx', dynamic=True, simplify=True)
+                print(f"   ✅ ONNX exported")
+            elif fmt == 'tflite':
+                model.export(format='tflite', int8=True)
+                print(f"   ✅ TFLite exported")
+            elif fmt == 'tensorrt':
+                model.export(format='engine', device=0)
+                print(f"   ✅ TensorRT exported")
+                
+        except Exception as e:
+            print(f"   ❌ {fmt.upper()} export failed: {e}")
+
+def visualize_training_results(runs_path):
+    """Visualize training results"""
+    runs_path = Path(runs_path)
+    
+    # Look for results
+    results_csv = runs_path / 'results.csv'
+    if results_csv.exists():
+        import pandas as pd
+        df = pd.read_csv(results_csv)
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        
+        # Training curves
+        if 'train/box_loss' in df.columns:
+            axes[0,0].plot(df['epoch'], df['train/box_loss'], label='Train')
+            if 'val/box_loss' in df.columns:
+                axes[0,0].plot(df['epoch'], df['val/box_loss'], label='Val')
+            axes[0,0].set_title('Box Loss')
+            axes[0,0].legend()
+        
+        if 'metrics/mAP50(B)' in df.columns:
+            axes[0,1].plot(df['epoch'], df['metrics/mAP50(B)'])
+            axes[0,1].set_title('mAP@0.5')
+        
+        if 'metrics/precision(B)' in df.columns and 'metrics/recall(B)' in df.columns:
+            axes[1,0].plot(df['epoch'], df['metrics/precision(B)'], label='Precision')
+            axes[1,0].plot(df['epoch'], df['metrics/recall(B)'], label='Recall')
+            axes[1,0].set_title('Precision & Recall')
+            axes[1,0].legend()
+        
+        if 'lr/pg0' in df.columns:
+            axes[1,1].plot(df['epoch'], df['lr/pg0'])
+            axes[1,1].set_title('Learning Rate')
+            axes[1,1].set_yscale('log')
+        
+        plt.tight_layout()
+        plt.savefig(runs_path / 'training_curves.png', dpi=300)
+        plt.show()
+        
+        print(f"📈 Training curves saved: {runs_path / 'training_curves.png'}")
+
+# ==========================================
+# MAIN EXECUTION FUNCTION
+# ==========================================
+
+def run_complete_pipeline():
+    """Run complete advanced training pipeline"""
+    print("🚀 Starting Complete Advanced YOLO8 Pipeline")
+    print("=" * 60)
+    
+    # Configuration
+    config = {
+        'model_size': 'yolov8n.pt',  # Bisa diganti ke s, m, l, x
+        'image_size': 640,
+        'batch_size': 16,
+        'epochs': 200,
+        'patience': 20,
+        
+        # Advanced features
+        'curriculum_learning': True,
+        'use_focal_loss': True,
+        'dynamic_weighting': True,
+        'use_ghost_conv': True,
+        'use_bifpn': True, 
+        'use_carafe': True,
+        'smart_augmentation': True,
+        'use_wandb': True,
+    }
+    
+    # Initialize trainer
+    trainer = AdvancedYOLOTrainer('/content/data', config)
+    
+    # Run training
+    model, results = trainer.train_model()
+    
+    if model is not None:
+        print("\n🎉 Pipeline completed successfully!")
+        
+        # Export model
+        best_model_path = trainer.runs_dir / 'weights' / 'best.pt'
+        if best_model_path.exists():
+            export_optimized_model(str(best_model_path), ['onnx'])
+        
+        # Visualize results
+        visualize_training_results(trainer.runs_dir)
+        
+        print(f"\n📁 Results saved in: {trainer.runs_dir}")
+        print(f"🏆 Best model: {best_model_path}")
+        
+        return trainer, model, results
+    else:
+        print("\n❌ Pipeline failed!")
+        return None, None, None
+
+# ==========================================
+# QUICK START FUNCTIONS
+# ==========================================
+
+def quick_start_training():
+    """Quick start untuk training dengan default settings"""
+    print("⚡ Quick Start Training")
+    
+    # Check data structure
+    data_path = Path('/content/data')
+    required_files = [
+        'images/train',
+        'images/val', 
+        'labels/train',
+        'labels/val',
+        'classes.txt'
+    ]
+    
+    missing = []
+    for req in required_files:
+        if not (data_path / req).exists():
+            missing.append(req)
+    
+    if missing:
+        print("❌ Missing required files/folders:")
+        for m in missing:
+            print(f"   - /content/data/{m}")
+        print("\nPlease upload your dataset first!")
+        return
+    
+    print("✅ Data structure validated")
+    
+    # Run pipeline
+    return run_complete_pipeline()
+
+if __name__ == "__main__":
+    # Run the complete pipeline
+    trainer, model, results = quick_start_training()
+    
+    if trainer:
+        print("\n🎯 Training Tips:")
+        print("1. Monitor Wandb dashboard untuk real-time metrics")
+        print("2. Check /content/runs/detect/advanced_yolo8/ untuk hasil")
+        print("3. Best model ada di weights/best.pt")
+        print("4. Gunakan ONNX model untuk deployment")
+        print("5. Untuk inference: model.predict('path/to/image', conf=0.001)")
